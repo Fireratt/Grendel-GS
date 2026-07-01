@@ -410,14 +410,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(
-        path, "transforms_train.json", white_background, extension
-    )
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(
-        path, "transforms_test.json", white_background, extension
-    )
-
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    
     if not eval:
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
@@ -425,31 +421,135 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, "points3d.ply")
-    if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
-        num_pts = 100_000
-        print(f"Generating random point cloud ({num_pts})...")
+    
+    # ========== 关键修复：删除旧的错误点云缓存 ==========
+    # 如果之前已经用错误的 [-1.3, 1.3] 范围生成过 points3d.ply，
+    # 必须手动删除它，否则下面的新逻辑不会执行。
+    # 首次运行此修复后，后续训练将直接加载正确的新点云。
+    if os.path.exists(ply_path):
+        # 简单检查：读取前几个点判断是否是旧的错误点云
+        try:
+            old_pcd = fetchPly(ply_path)
+            old_xyz = np.asarray(old_pcd.points)
+            if old_xyz.max() <= 1.35 and old_xyz.min() >= -1.35:
+                print(f"[WARNING] Detected legacy random point cloud in {ply_path}")
+                print(f"          Range: [{old_xyz.min():.3f}, {old_xyz.max():.3f}]")
+                print(f"          Deleting to regenerate with scene-aware bounds...")
+                os.remove(ply_path)
+        except Exception:
+            pass
+    # =====================================================
 
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+    if not os.path.exists(ply_path):
+        num_pts = 300_000
+        print(f"Generating random point cloud ({num_pts})...")
+        
+        # ========== 核心修复：在训练相机视锥内采样初始化点云 ==========
+        cam_centers = []
+        cam_rotations = []
+        view_dirs = []
+        tan_half_fovx = []
+        tan_half_fovy = []
+
+        for cam_info in train_cam_infos:
+            w2c = np.eye(4, dtype=np.float32)
+            w2c[:3, :3] = cam_info.R
+            w2c[:3, 3] = cam_info.T
+            c2w = np.linalg.inv(w2c)
+
+            rotation = c2w[:3, :3].astype(np.float32)
+            center = c2w[:3, 3].astype(np.float32)
+            view_dir = rotation[:, 2]
+            view_dir /= max(np.linalg.norm(view_dir), 1e-8)
+
+            cam_centers.append(center)
+            cam_rotations.append(rotation)
+            view_dirs.append(view_dir)
+            tan_half_fovx.append(np.tan(cam_info.FovX * 0.5))
+            tan_half_fovy.append(np.tan(cam_info.FovY * 0.5))
+
+        cam_centers = np.stack(cam_centers, axis=0)
+        cam_rotations = np.stack(cam_rotations, axis=0)
+        view_dirs = np.stack(view_dirs, axis=0)
+        tan_half_fovx = np.asarray(tan_half_fovx, dtype=np.float32)
+        tan_half_fovy = np.asarray(tan_half_fovy, dtype=np.float32)
+
+        cam_center_mean = cam_centers.mean(axis=0)
+        scene_radius = np.linalg.norm(cam_centers - cam_center_mean, axis=1).max()
+        scene_radius = max(float(scene_radius), 1.0)
+
+        A = np.zeros((3, 3), dtype=np.float64)
+        b = np.zeros(3, dtype=np.float64)
+        eye = np.eye(3, dtype=np.float64)
+        for center, view_dir in zip(cam_centers, view_dirs):
+            projector = eye - np.outer(view_dir, view_dir)
+            A += projector
+            b += projector @ center
+
+        if np.linalg.matrix_rank(A) == 3:
+            focus_point = np.linalg.solve(A, b).astype(np.float32)
+        else:
+            mean_dir = view_dirs.mean(axis=0)
+            mean_dir_norm = np.linalg.norm(mean_dir)
+            if mean_dir_norm < 1e-6:
+                mean_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                mean_dir = (mean_dir / mean_dir_norm).astype(np.float32)
+            focus_point = cam_center_mean + mean_dir * scene_radius
+
+        focus_h = np.concatenate([focus_point, np.array([1.0], dtype=np.float32)])
+        depth_min = []
+        depth_max = []
+        z_signs = []
+        for cam_info in train_cam_infos:
+            w2c = np.eye(4, dtype=np.float32)
+            w2c[:3, :3] = cam_info.R.transpose()
+            w2c[:3, 3] = cam_info.T
+            focus_cam = w2c @ focus_h
+            focus_depth = abs(float(focus_cam[2]))
+            depth_lo = max(focus_depth * 0.5, scene_radius * 0.15)
+            depth_hi = max(focus_depth * 1.5, depth_lo + scene_radius * 0.1)
+            depth_min.append(depth_lo)
+            depth_max.append(depth_hi)
+            z_signs.append(1.0 if focus_cam[2] >= 0.0 else -1.0)
+
+        depth_min = np.asarray(depth_min, dtype=np.float32)
+        depth_max = np.asarray(depth_max, dtype=np.float32)
+        z_signs = np.asarray(z_signs, dtype=np.float32)
+
+        cam_indices = np.random.randint(0, len(train_cam_infos), size=num_pts)
+        depths = np.random.uniform(depth_min[cam_indices], depth_max[cam_indices]).astype(np.float32)
+        xs = np.random.uniform(-0.8, 0.8, size=num_pts).astype(np.float32) * depths * tan_half_fovx[cam_indices]
+        ys = np.random.uniform(-0.8, 0.8, size=num_pts).astype(np.float32) * depths * tan_half_fovy[cam_indices]
+        zs = depths * z_signs[cam_indices]
+        local_points = np.stack([xs, ys, zs], axis=1)
+        xyz = cam_centers[cam_indices] + np.einsum("nij,nj->ni", cam_rotations[cam_indices], local_points)
+
+        print(f"[INIT] Camera centers range: x=[{cam_centers[:,0].min():.2f}, {cam_centers[:,0].max():.2f}] "
+              f"y=[{cam_centers[:,1].min():.2f}, {cam_centers[:,1].max():.2f}] "
+              f"z=[{cam_centers[:,2].min():.2f}, {cam_centers[:,2].max():.2f}]")
+        print(f"[INIT] Focus point: ({focus_point[0]:.2f}, {focus_point[1]:.2f}, {focus_point[2]:.2f})")
+        print(f"[INIT] Depth range: [{depth_min.min():.2f}, {depth_max.max():.2f}]")
+        print(f"[INIT] Point cloud sample range: x=[{xyz[:,0].min():.2f}, {xyz[:,0].max():.2f}] "
+              f"y=[{xyz[:,1].min():.2f}, {xyz[:,1].max():.2f}] "
+              f"z=[{xyz[:,2].min():.2f}, {xyz[:,2].max():.2f}]")
+        # ================================================================
+        
         shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(
-            points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3))
-        )
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
 
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    
     try:
         pcd = fetchPly(ply_path)
     except:
         pcd = None
 
-    scene_info = SceneInfo(
-        point_cloud=pcd,
-        train_cameras=train_cam_infos,
-        test_cameras=test_cam_infos,
-        nerf_normalization=nerf_normalization,
-        ply_path=ply_path,
-    )
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
     return scene_info
 
 

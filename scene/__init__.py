@@ -46,20 +46,16 @@ class Scene:
             print("Loading trained model at iteration {}".format(self.loaded_iter))
 
         utils.log_cpu_memory_usage("before loading images meta data")
-
+        print(f"""try find {os.path.join(args.source_path, "transforms_train.json")}""")
         if os.path.exists(
             os.path.join(args.source_path, "sparse")
         ):  # This is the format from colmap.
             scene_info = sceneLoadTypeCallbacks["Colmap"](
                 args.source_path, args.images, args.eval, args.llffhold
             )
-        elif "matrixcity" in args.source_path:  # This is for matrixcity
-            scene_info = sceneLoadTypeCallbacks["City"](
-                args.source_path,
-                args.random_background,
-                args.white_background,
-                llffhold=args.llffhold,
-            )
+        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+            print("Found transforms_train.json file, assuming Blender data set!")
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
         else:
             raise ValueError("No valid dataset found in the source path")
 

@@ -1,0 +1,15 @@
+torchrun --standalone --nnodes=1 --nproc-per-node=2 train.py \
+    -s /home/ps/hjf/3dgs/res/matrix_city/small_city/aerial_downsampled/pose/block_all \
+    -m /home/ps/hjf/3dgs/res/matrix_city/output/grendel_all \
+    --eval \
+    --bsz 4 \
+    --backend gsplat \
+    --iterations 40000 \
+    --test_iterations 7000 15000 30000 40000 \
+    --save_iterations 10000 20000 30000 40000 \
+    --checkpoint_iterations 10000 20000 30000 \
+    --densify_until_iter 30000 \
+    --densification_interval 200 \
+    --opacity_reset_interval 5000 \
+    --lambda_dssim 0.2 \
+    --lr_scale_mode sqrt
