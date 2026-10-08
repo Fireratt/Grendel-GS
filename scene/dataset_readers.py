@@ -372,21 +372,14 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             )  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
-            image_path = os.path.join(path, cam_name)
+            image_path = cam_name
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
+            width, height = image.size
+            image.close()
+            image = None
 
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (
-                1 - norm_data[:, :, 3:4]
-            )
-            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
-
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            fovy = focal2fov(fov2focal(fovx, width), height)
             FovY = fovy
             FovX = fovx
 
@@ -397,11 +390,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                     T=T,
                     FovY=FovY,
                     FovX=FovX,
-                    image=image,
+                    image=None,
                     image_path=image_path,
                     image_name=image_name,
-                    width=image.size[0],
-                    height=image.size[1],
+                    width=width,
+                    height=height,
                 )
             )
 

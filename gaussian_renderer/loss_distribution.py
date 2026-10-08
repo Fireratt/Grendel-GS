@@ -2339,8 +2339,9 @@ def load_camera_from_cpu_to_all_gpu_for_eval(
     if args.distributed_dataset_storage:
         if args.local_sampling:
             for idx, camera in enumerate(batched_cameras):
-                if camera.original_image_backup is not None:
-                    camera.original_image = camera.original_image_backup.cuda()
+                if camera.has_local_image_source():
+                    image_backup = camera.get_image_backup()
+                    camera.original_image = image_backup.cuda()
                     scatter_list = [
                         camera.original_image for _ in range(utils.IN_NODE_GROUP.size())
                     ]
@@ -2366,7 +2367,8 @@ def load_camera_from_cpu_to_all_gpu_for_eval(
 
         if utils.IN_NODE_GROUP.rank() == 0:
             for camera in batched_cameras:
-                camera.original_image = camera.original_image_backup.cuda()
+                image_backup = camera.get_image_backup()
+                camera.original_image = image_backup.cuda()
                 scatter_list = [
                     camera.original_image for _ in range(utils.IN_NODE_GROUP.size())
                 ]
@@ -2389,7 +2391,8 @@ def load_camera_from_cpu_to_all_gpu_for_eval(
                 )
     else:
         for camera in batched_cameras:
-            camera.original_image = camera.original_image_backup.cuda()
+            image_backup = camera.get_image_backup()
+            camera.original_image = image_backup.cuda()
 
 
 def load_camera_from_cpu_to_all_gpu(batched_cameras, batched_strategies, gpuid2tasks):
@@ -2411,10 +2414,9 @@ def load_camera_from_cpu_to_all_gpu(batched_cameras, batched_strategies, gpuid2t
             if camera_id_in_batch == last_task[0]:
                 coverage_max_y = coverage_max_y_last_task
 
+            image_backup = batched_cameras[camera_id_in_batch].get_image_backup()
             batched_cameras[camera_id_in_batch].original_image = (
-                batched_cameras[camera_id_in_batch]
-                .original_image_backup[:, coverage_min_y:coverage_max_y, :]
-                .cuda()
+                image_backup[:, coverage_min_y:coverage_max_y, :].cuda()
             )
             coverage_min_max_y[camera_id_in_batch] = (coverage_min_y, coverage_max_y)
         return coverage_min_max_y

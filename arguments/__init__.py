@@ -88,6 +88,9 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = "/tmp/gaussian_splatting"
         self._images = "images"
+        # -1 applies the automatic 1600px-wide cap; --resolution 1 keeps the
+        # original image size.
+        self._resolution = -1
         self._white_background = False
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -129,6 +132,7 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_until_iter = -1
         self.random_background = False
         self.min_opacity = 0.005
+        self.prune_scale3d = 0.1
         self.lr_scale_mode = "sqrt"  # can be "linear", "sqrt", or "accumu"
         super().__init__(parser, "Optimization Parameters")
 
@@ -166,6 +170,12 @@ class DistributionParams(ParamGroup):
         )
         self.preload_dataset_to_gpu_threshold = (
             10  # unit is GB, by default 10GB memory limit for dataset.
+        )
+        self.image_loading_mode = (
+            "auto"  # "auto", "eager", or "lazy" loading for CPU-side image tensors.
+        )
+        self.image_loading_auto_ram_budget_ratio = (
+            0.5  # In auto mode, eager loading is allowed up to this fraction of available host RAM.
         )
         self.multiprocesses_image_loading = True
         self.num_train_cameras = -1
@@ -273,6 +283,11 @@ def find_latest_checkpoint(log_folder):
 
 
 def init_args(args):
+    if args.image_loading_mode not in {"auto", "eager", "lazy"}:
+        raise ValueError(
+            "image_loading_mode must be one of {'auto', 'eager', 'lazy'}"
+        )
+    args.lazy_image_loading = args.image_loading_mode == "lazy"
 
     if args.opacity_reset_until_iter == -1:
         args.opacity_reset_until_iter = args.densify_until_iter + args.bsz

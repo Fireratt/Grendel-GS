@@ -1002,7 +1002,9 @@ class GaussianModel:
             new_send_to_gpui_cnt,
         )
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(
+        self, max_grad, min_opacity, extent, max_screen_size, prune_scale3d
+    ):
         args = utils.get_args()
         if not args.gaussians_distribution and utils.DEFAULT_GROUP.size() > 1:
             torch.distributed.all_reduce(
@@ -1025,21 +1027,70 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        opacity_prune_mask = (self.get_opacity < min_opacity).squeeze()
+        screen_size_prune_mask = torch.zeros_like(opacity_prune_mask)
+        scale_prune_mask = torch.zeros_like(opacity_prune_mask)
         if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
+            screen_size_prune_mask = self.max_radii2D > max_screen_size
             # NOTE: this is bug in its implementation.
             assert torch.all(
                 self.max_radii2D == 0
             ), "In its implementation, max_radii2D is all 0. This is a bug."
             assert torch.all(
-                big_points_vs == False
+                screen_size_prune_mask == False
             ), "In its implementation, big_points_vs is all False. This is a bug."
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(
-                torch.logical_or(prune_mask, big_points_vs), big_points_ws
+            scale_prune_mask = (
+                self.get_scaling.max(dim=1).values > prune_scale3d * extent
             )
+        prune_mask = torch.logical_or(
+            torch.logical_or(opacity_prune_mask, screen_size_prune_mask),
+            scale_prune_mask,
+        )
+        num_before_prune = self.get_xyz.shape[0]
+        num_pruned = int(prune_mask.sum().item())
+        prune_counts = torch.tensor(
+            [
+                num_before_prune,
+                int(opacity_prune_mask.sum().item()),
+                int(screen_size_prune_mask.sum().item()),
+                int(scale_prune_mask.sum().item()),
+                num_pruned,
+            ],
+            dtype=torch.int64,
+            device=self.get_xyz.device,
+        )
+        if args.gaussians_distribution and utils.DEFAULT_GROUP.size() > 1:
+            dist.all_reduce(prune_counts, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
+
         self.prune_points(prune_mask)
+        num_after_prune = self.get_xyz.shape[0]
+        if args.gaussians_distribution and utils.DEFAULT_GROUP.size() > 1:
+            after_count = torch.tensor(
+                [num_after_prune], dtype=torch.int64, device=self.get_xyz.device
+            )
+            dist.all_reduce(after_count, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
+            num_after_prune = int(after_count.item())
+
+        if utils.GLOBAL_RANK == 0:
+            message = (
+                "iteration[{},{}): prune triggered={} before={} "
+                "opacity_candidates={} scale3d_candidates={} "
+                "screen_size_candidates={} unique_pruned={} after={}\n"
+            ).format(
+                utils.get_cur_iter(),
+                utils.get_cur_iter() + args.bsz,
+                int(prune_counts[4].item()) > 0,
+                int(prune_counts[0].item()),
+                int(prune_counts[1].item()),
+                int(prune_counts[3].item()),
+                int(prune_counts[2].item()),
+                int(prune_counts[4].item()),
+                num_after_prune,
+            )
+            print(message, end="", flush=True)
+            log_file = utils.get_log_file()
+            log_file.write(message)
+            log_file.flush()
 
         torch.cuda.empty_cache()
 

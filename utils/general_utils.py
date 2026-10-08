@@ -20,6 +20,7 @@ import torch.distributed as dist
 import time
 from argparse import Namespace
 import psutil
+from PIL import Image
 
 ARGS = None
 LOG_FILE = None
@@ -343,6 +344,39 @@ def check_memory_usage(log_file, args, iteration, gaussians, before_densificatio
                 "Reserved Memory usage is reaching the upper bound of GPU memory. stop densification.\n"
             )
             args.disable_auto_densification = True
+
+
+def prepare_image_for_training(pil_image, white_background):
+    if pil_image.mode == "RGB":
+        return pil_image
+
+    if pil_image.mode in ("RGBA", "LA") or "transparency" in pil_image.info:
+        rgba_image = pil_image.convert("RGBA")
+        background = Image.new(
+            "RGBA",
+            rgba_image.size,
+            (255, 255, 255, 255) if white_background else (0, 0, 0, 255),
+        )
+        return Image.alpha_composite(background, rgba_image).convert("RGB")
+
+    return pil_image.convert("RGB")
+
+
+def load_image_tensor_from_path(
+    image_path, resolution, args, log_file, white_background, decompressed_image=None
+):
+    if decompressed_image is not None:
+        return decompressed_image.contiguous()
+
+    disk_image = Image.open(image_path)
+    prepared_image = disk_image
+    try:
+        prepared_image = prepare_image_for_training(disk_image, white_background)
+        return PILtoTorch(prepared_image, resolution, args, log_file).contiguous()
+    finally:
+        if prepared_image is not disk_image:
+            prepared_image.close()
+        disk_image.close()
 
 
 def PILtoTorch(pil_image, resolution, args, log_file, decompressed_image=None):

@@ -39,6 +39,7 @@ def densification(iteration, scene, gaussians, batched_screenspace_pkg):
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
+                args.prune_scale3d,
             )
             timers.stop("densify_and_prune")
 
@@ -135,6 +136,7 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
+                args.prune_scale3d,
             )
             timers.stop("densify_and_prune")
 

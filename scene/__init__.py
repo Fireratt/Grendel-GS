@@ -16,7 +16,11 @@ from random import randint
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.camera_utils import (
+    cameraList_from_camInfos,
+    camera_to_JSON,
+    resolve_resolution,
+)
 import utils.general_utils as utils
 import torch
 
@@ -92,31 +96,74 @@ class Scene:
             scene_info.train_cameras[0].width,
             scene_info.train_cameras[0].height,
         )
-        utils.set_img_size(orig_h, orig_w)
+        resolution_w, resolution_h = resolve_resolution(args, orig_w, orig_h)
+        utils.set_img_size(resolution_h, resolution_w)
         # Dataset size in GB
         dataset_size_in_GB = (
             1.0
             * (len(scene_info.train_cameras) + len(scene_info.test_cameras))
-            * orig_w
-            * orig_h
+            * resolution_w
+            * resolution_h
             * 3
             / 1e9
         )
-        log_file.write(f"Dataset size: {dataset_size_in_GB} GB\n")
+        resident_dataset_size_in_GB = dataset_size_in_GB
+        if args.distributed_dataset_storage and args.local_sampling:
+            resident_dataset_size_in_GB /= max(utils.WORLD_SIZE, 1)
+
+        available_cpu_memory_in_GB = (
+            utils.psutil.virtual_memory().available / 1024 / 1024 / 1024
+        )
+        if args.preload_dataset_to_gpu:
+            args.lazy_image_loading = False
+            resolved_image_loading_mode = "eager"
+        elif args.image_loading_mode == "auto":
+            eager_loading_budget_in_GB = (
+                available_cpu_memory_in_GB * args.image_loading_auto_ram_budget_ratio
+            )
+            args.lazy_image_loading = (
+                resident_dataset_size_in_GB > eager_loading_budget_in_GB
+            )
+            resolved_image_loading_mode = (
+                "lazy" if args.lazy_image_loading else "eager"
+            )
+        else:
+            args.lazy_image_loading = args.image_loading_mode == "lazy"
+            resolved_image_loading_mode = args.image_loading_mode
+
+        log_file.write(f"Dataset size: {dataset_size_in_GB:.2f} GB\n")
+        log_file.write(
+            "Image loading mode: requested={} resolved={} resident_dataset_size={:.2f} GB available_cpu_memory={:.2f} GB\n".format(
+                args.image_loading_mode,
+                resolved_image_loading_mode,
+                resident_dataset_size_in_GB,
+                available_cpu_memory_in_GB,
+            )
+        )
+        utils.print_rank_0(
+            "Image loading mode: requested={} resolved={} resident_dataset_size={:.2f} GB available_cpu_memory={:.2f} GB".format(
+                args.image_loading_mode,
+                resolved_image_loading_mode,
+                resident_dataset_size_in_GB,
+                available_cpu_memory_in_GB,
+            )
+        )
         if (
-            dataset_size_in_GB < args.preload_dataset_to_gpu_threshold
+            (not args.lazy_image_loading)
+            and dataset_size_in_GB < args.preload_dataset_to_gpu_threshold
         ):  # 10GB memory limit for dataset
             log_file.write(
-                f"[NOTE]: Preloading dataset({dataset_size_in_GB}GB) to GPU. Disable local_sampling and distributed_dataset_storage.\n"
+                f"[NOTE]: Preloading dataset({dataset_size_in_GB:.2f}GB) to GPU. Disable local_sampling and distributed_dataset_storage.\n"
             )
             print(
-                f"[NOTE]: Preloading dataset({dataset_size_in_GB}GB) to GPU. Disable local_sampling and distributed_dataset_storage."
+                f"[NOTE]: Preloading dataset({dataset_size_in_GB:.2f}GB) to GPU. Disable local_sampling and distributed_dataset_storage."
             )
             args.preload_dataset_to_gpu = True
             args.local_sampling = False  # TODO: Preloading dataset to GPU is not compatible with local_sampling and distributed_dataset_storage for now. Fix this.
             args.distributed_dataset_storage = False
 
-        # Train on original resolution, no downsampling in our implementation.
+        # Train at the resolution resolved from --resolution.  By default,
+        # images wider than 1600px are automatically downscaled.
         utils.print_rank_0("Decoding Training Cameras")
         self.train_cameras = None
         self.test_cameras = None
@@ -202,7 +249,7 @@ class SceneDataset:
         self.camera_size = len(self.cameras)
         self.sample_camera_idx = []
         for i in range(self.camera_size):
-            if self.cameras[i].original_image_backup is not None:
+            if self.cameras[i].has_local_image_source():
                 self.sample_camera_idx.append(i)
         # print("Number of cameras with sample images: ", len(self.sample_camera_idx))
 

@@ -8,7 +8,6 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
 import torch
 import torch.distributed as dist
 from scene import Scene, SceneDataset

@@ -12,4 +12,5 @@ torchrun --standalone --nnodes=1 --nproc-per-node=2 train.py \
     --densification_interval 200 \
     --opacity_reset_interval 5000 \
     --lambda_dssim 0.2 \
-    --lr_scale_mode sqrt
+    --lr_scale_mode sqrt \
+    --image_loading_mode lazy

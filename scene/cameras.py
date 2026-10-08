@@ -30,6 +30,9 @@ class Camera(nn.Module):
         gt_alpha_mask,
         image_name,
         uid,
+        image_path=None,
+        image_width=None,
+        image_height=None,
         trans=np.array([0.0, 0.0, 0.0]),
         scale=1.0,
     ):
@@ -42,6 +45,7 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.image_path = image_path
 
         args = get_args()
         log_file = get_log_file()
@@ -49,7 +53,7 @@ class Camera(nn.Module):
         if args.time_image_loading:
             start_time = time.time()
 
-        if (
+        self.stores_image_locally = (
             (
                 args.local_sampling
                 and args.distributed_dataset_storage
@@ -61,16 +65,26 @@ class Camera(nn.Module):
                 and utils.LOCAL_RANK == 0
             )
             or (not args.distributed_dataset_storage)
-        ):
-            # load to cpu
+        )
+
+        if self.stores_image_locally and image is not None:
             self.original_image_backup = image.contiguous()
             if args.preload_dataset_to_gpu:
                 self.original_image_backup = self.original_image_backup.to("cuda")
-            self.image_width = self.original_image_backup.shape[2]
-            self.image_height = self.original_image_backup.shape[1]
         else:
             self.original_image_backup = None
-            self.image_height, self.image_width = utils.get_img_size()
+
+        if image_width is None or image_height is None:
+            fallback_height, fallback_width = utils.get_img_size()
+            image_height = fallback_height
+            image_width = fallback_width
+
+        self.image_width = image_width
+        self.image_height = image_height
+
+        if self.original_image_backup is not None:
+            self.image_width = self.original_image_backup.shape[2]
+            self.image_height = self.original_image_backup.shape[1]
 
         if args.time_image_loading:
             log_file.write(f"Image processing in {time.time() - start_time} seconds\n")
@@ -98,6 +112,25 @@ class Camera(nn.Module):
             )
         ).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    def has_local_image_source(self):
+        return self.stores_image_locally
+
+    def get_image_backup(self):
+        if not self.stores_image_locally:
+            return None
+        if self.original_image_backup is not None:
+            return self.original_image_backup
+
+        args = get_args()
+        log_file = get_log_file()
+        return utils.load_image_tensor_from_path(
+            self.image_path,
+            (self.image_width, self.image_height),
+            args,
+            log_file,
+            white_background=args.white_background,
+        )
 
     def get_camera2world(self):
         return self.world_view_transform_backup.t().inverse()

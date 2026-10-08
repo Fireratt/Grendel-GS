@@ -11,7 +11,7 @@
 
 from scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch, get_args, get_log_file
+from utils.general_utils import get_args, get_log_file, load_image_tensor_from_path
 import utils.general_utils as utils
 from tqdm import tqdm
 from utils.graphics_utils import fov2focal
@@ -22,16 +22,54 @@ import torch
 from PIL import Image
 
 
-def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
+WARNED = False
+
+
+def resolve_resolution(args, orig_w, orig_h, resolution_scale=1.0):
+    """Resolve the image size used for camera tensors and training images."""
+    global WARNED
+
+    if args.resolution in [1, 2, 4, 8]:
+        resolution = (
+            round(orig_w / (resolution_scale * args.resolution)),
+            round(orig_h / (resolution_scale * args.resolution)),
+        )
+    else:
+        if args.resolution == -1:
+            if orig_w > 1600:
+                if not WARNED:
+                    print(
+                        "[ INFO ] Encountered quite large input images (>1.6K "
+                        "pixels width), rescaling to 1.6K.\n"
+                        "If this is not desired, please explicitly specify "
+                        "'--resolution/-r' as 1"
+                    )
+                    WARNED = True
+                global_down = orig_w / 1600
+            else:
+                global_down = 1
+        else:
+            global_down = orig_w / args.resolution
+
+        scale = float(global_down) * float(resolution_scale)
+        resolution = (int(orig_w / scale), int(orig_h / scale))
+
+    return max(1, resolution[0]), max(1, resolution[1])
+
+
+def loadCam(
+    args,
+    id,
+    cam_info,
+    decompressed_image=None,
+    return_image=False,
+    resolution_scale=1.0,
+):
     orig_w, orig_h = cam_info.width, cam_info.height
-    assert (
-        orig_w == utils.get_img_width() and orig_h == utils.get_img_height()
-    ), "All images should have the same size. "
 
     args = get_args()
     log_file = get_log_file()
-    resolution = orig_w, orig_h
-    # NOTE: we do not support downsampling here.
+    resolution = resolve_resolution(args, orig_w, orig_h, resolution_scale)
 
     # may use cam_info.uid
     if (
@@ -47,22 +85,25 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
         )
         or (not args.distributed_dataset_storage)
     ):
-        if args.time_image_loading:
-            start_time = time.time()
-        image = Image.open(cam_info.image_path)
-        resized_image_rgb = PILtoTorch(
-            image, resolution, args, log_file, decompressed_image=decompressed_image
-        )
-        if args.time_image_loading:
-            log_file.write(f"PILtoTorch image in {time.time() - start_time} seconds\n")
+        gt_image = None
+        if (not args.lazy_image_loading) or return_image:
+            if args.time_image_loading:
+                start_time = time.time()
+            resized_image_rgb = load_image_tensor_from_path(
+                cam_info.image_path,
+                resolution,
+                args,
+                log_file,
+                white_background=args.white_background,
+                decompressed_image=decompressed_image,
+            )
+            if args.time_image_loading:
+                log_file.write(
+                    f"PILtoTorch image in {time.time() - start_time} seconds\n"
+                )
 
-        # assert resized_image_rgb.shape[0] == 3, "Image should have exactly 3 channels!"
-        gt_image = resized_image_rgb[:3, ...].contiguous()
+            gt_image = resized_image_rgb[:3, ...].contiguous()
         loaded_mask = None
-
-        # Free the memory: because the PIL image has been converted to torch tensor, we don't need it anymore. And it takes up lots of cpu memory.
-        image.close()
-        image = None
     else:
         gt_image = None
         loaded_mask = None
@@ -80,16 +121,28 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
         gt_alpha_mask=loaded_mask,
         image_name=cam_info.image_name,
         uid=id,
+        image_path=cam_info.image_path,
+        image_width=resolution[0],
+        image_height=resolution[1],
     )
 
 
 def load_decompressed_image(params):
-    args, id, cam_info = params
-    return loadCam(args, id, cam_info, decompressed_image=None, return_image=True)
+    args, id, cam_info, resolution_scale = params
+    return loadCam(
+        args,
+        id,
+        cam_info,
+        decompressed_image=None,
+        return_image=True,
+        resolution_scale=resolution_scale,
+    )
 
 
 # Modify this code to support shared_memory.SharedMemory to make inter-process communication faster
-def decompressed_images_from_camInfos_multiprocess(cam_infos, args):
+def decompressed_images_from_camInfos_multiprocess(
+    cam_infos, args, resolution_scale=1.0
+):
     args = get_args()
     decompressed_images = []
     total_cameras = len(cam_infos)
@@ -97,7 +150,10 @@ def decompressed_images_from_camInfos_multiprocess(cam_infos, args):
     # Create a pool of processes
     with multiprocessing.Pool(processes=2) as pool:
         # Prepare data for processing
-        tasks = [(args, id, cam_info) for id, cam_info in enumerate(cam_infos)]
+        tasks = [
+            (args, id, cam_info, resolution_scale)
+            for id, cam_info in enumerate(cam_infos)
+        ]
 
         # Map load_camera_data to the tasks
         # results = pool.map(load_decompressed_image, tasks)
@@ -115,18 +171,23 @@ def decompressed_images_from_camInfos_multiprocess(cam_infos, args):
     return decompressed_images
 
 
-def decompress_and_scale_image(cam_info):
-    pil_image = cam_info.image
-    resolution = cam_info.image.size  # (w, h)
-    # print("cam_info.image.size: ", cam_info.image.size)
-    pil_image.load()
-    resized_image_PIL = pil_image.resize(resolution)
-    resized_image = np.array(resized_image_PIL)  # (h, w, 3)
-    # print("resized_image.shape: ", resized_image.shape)
-    if len(resized_image.shape) == 3:
-        return resized_image.transpose(2, 0, 1)
-    else:
-        return resized_image[..., np.newaxis].transpose(2, 0, 1)
+def decompress_and_scale_image(cam_info, resolution_scale=1.0):
+    args = get_args()
+    log_file = get_log_file()
+    resolution = resolve_resolution(
+        args, cam_info.width, cam_info.height, resolution_scale
+    )
+    return (
+        load_image_tensor_from_path(
+            cam_info.image_path,
+            resolution,
+            args,
+            log_file,
+            white_background=args.white_background,
+        )
+        .cpu()
+        .numpy()
+    )
 
 
 def load_decompressed_image_shared(params):
@@ -136,7 +197,9 @@ def load_decompressed_image_shared(params):
 
     # Assume each image will be stored as a flat array in shared memory
     # Example: using numpy for manipulation; adjust size and dtype as needed
-    resolution_width, resolution_height = cam_info.image.size
+    resolution_width, resolution_height = resolve_resolution(
+        args, cam_info.width, cam_info.height, resolution_scale
+    )
     image_shape = (3, resolution_height, resolution_width)  # Set appropriate values
     dtype = np.uint8  # Adjust as per your image data type
 
@@ -147,7 +210,9 @@ def load_decompressed_image_shared(params):
     )
 
     # Decompress image into the numpy array directly
-    decompressed_image = decompress_and_scale_image(cam_info)  # Implement this
+    decompressed_image = decompress_and_scale_image(
+        cam_info, resolution_scale
+    )  # Implement this
     np_image_array[:] = decompressed_image
 
     # Clean up
@@ -162,7 +227,12 @@ def decompressed_images_from_camInfos_multiprocess_sharedmem(
     total_cameras = len(cam_infos)
 
     # Assume each image shape and dtype
-    resolution_width, resolution_height = cam_infos[0].image.size
+    resolution_width, resolution_height = resolve_resolution(
+        args,
+        cam_infos[0].width,
+        cam_infos[0].height,
+        resolution_scale,
+    )
     image_shape = (
         3,
         resolution_height,
@@ -207,12 +277,12 @@ def decompressed_images_from_camInfos_multiprocess_sharedmem(
     return decompressed_images
 
 
-def cameraList_from_camInfos(cam_infos, args):
+def cameraList_from_camInfos(cam_infos, args, resolution_scale=1.0):
     args = get_args()
 
-    if args.multiprocesses_image_loading:
+    if args.multiprocesses_image_loading and not args.lazy_image_loading:
         decompressed_images = decompressed_images_from_camInfos_multiprocess(
-            cam_infos, args
+            cam_infos, args, resolution_scale
         )
         # decompressed_images = decompressed_images_from_camInfos_multiprocess_sharedmem(cam_infos, resolution_scale, args)
     else:
@@ -229,6 +299,7 @@ def cameraList_from_camInfos(cam_infos, args):
                 c,
                 decompressed_image=decompressed_images[id],
                 return_image=False,
+                resolution_scale=resolution_scale,
             )
         )
 
