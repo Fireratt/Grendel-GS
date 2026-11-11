@@ -13,16 +13,27 @@ recursive_render.py \
 --resolutions 1.0 0.5 3840x2160
 
 torchrun --standalone --nnodes=1 --nproc-per-node=2 \
-recursive_render.py /home/ps/hjf/3dgs/res/training/building \
---resolutions 1.0 0.5 3840x2160
+recursive_render.py /home/ps/hjf/3dgs/res/training/building /home/ps/hjf/3dgs/res/training/building/output/grendel_all \
+--iteration 70000 \
+--resolutions 1.0 0.5 640x480
 Single-GPU: 
 torchrun --standalone --nnodes=1 --nproc-per-node=1 recursive_render.py \
 --recursive /home/ps/hjf/3dgs/res/training/deep-blending \
 --resolutions 1.0 0.5 3840x2160 2>&1 | tee recursive_render.log
+
+Render an explicit NeRF camera trace:
+torchrun --standalone --nnodes=1 --nproc-per-node=1 recursive_render.py \
+/home/ps/hjf/3dgs/res/training/building /home/ps/hjf/3dgs/res/training/building/output/grendel_all \
+--iteration 70000 \
+--camera-sequence /home/ps/hjf/3dgs/res/training/building/stress_nerf/fov_1.1.json \
+--resolutions 1.0 0.5 3840x2160 \
+--no-save-renders
 """
 
 import argparse
 import csv
+import json
+import math
 import os
 import statistics
 import sys
@@ -34,6 +45,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torchvision
+import numpy as np
 
 import utils.general_utils as utils
 from arguments import (
@@ -56,6 +68,7 @@ from gaussian_renderer.workload_division import (
     start_strategy_final,
 )
 from scene import Scene, SceneDataset
+from scene.cameras import Camera
 from utils.general_utils import (
     init_distributed,
     safe_state,
@@ -75,6 +88,9 @@ INFERENCE_BATCH_SIZE = 1
 # Edit this list for the default benchmark resolutions.  Values without an
 # explicit size are scale factors relative to the dataset's original size.
 DEFAULT_RESOLUTIONS = ["1.0", "0.5", "0.25"]
+
+# Optional camera traces generated next to the merged point cloud.
+PRESSURE_SEQUENCES = ("pressure_scan", "pressure_orbit")
 
 
 def build_model_parser():
@@ -139,12 +155,133 @@ def resolve_resolution(spec, base_width, base_height):
     return label, width, height
 
 
+def _positive_dimension(value):
+    if value is None:
+        return None
+    dimension = int(round(float(value)))
+    return dimension if dimension > 0 else None
+
+
+def load_camera_sequence(sequence_path):
+    """Load stress-nerf camera poses from a transforms-style JSON file."""
+    sequence_path = Path(sequence_path).expanduser().resolve()
+    contents = json.loads(sequence_path.read_text())
+    frames = contents.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError(f"Camera sequence has no frames: {sequence_path}")
+
+    width = _positive_dimension(contents.get("w"))
+    height = _positive_dimension(contents.get("h"))
+    cx = contents.get("cx")
+    cy = contents.get("cy")
+    # stress-nerf sequences may leave w/h null but provide a centered principal
+    # point, from which the native image dimensions can be recovered.
+    if width is None and cx is not None:
+        width = _positive_dimension(2.0 * float(cx))
+    if height is None and cy is not None:
+        height = _positive_dimension(2.0 * float(cy))
+    if width is None or height is None:
+        raise ValueError(
+            f"Camera sequence must specify positive w/h or centered cx/cy: {sequence_path}"
+        )
+
+    if cx is not None and abs(float(cx) - width / 2.0) > 1.0:
+        raise ValueError("Off-center cx is unsupported by the current pinhole renderer.")
+    if cy is not None and abs(float(cy) - height / 2.0) > 1.0:
+        raise ValueError("Off-center cy is unsupported by the current pinhole renderer.")
+
+    for distortion_name in ("k1", "k2", "k3", "k4", "p1", "p2"):
+        distortion = float(contents.get(distortion_name, 0.0) or 0.0)
+        if abs(distortion) > 1e-8:
+            raise ValueError(
+                f"Non-zero {distortion_name} distortion is unsupported by the current renderer."
+            )
+
+    fx = contents.get("fl_x")
+    fy = contents.get("fl_y", fx)
+    fov_x = contents.get("camera_angle_x")
+    if fov_x is None:
+        if fx is None or float(fx) <= 0:
+            raise ValueError("Camera sequence requires camera_angle_x or positive fl_x.")
+        fov_x = 2.0 * math.atan(width / (2.0 * float(fx)))
+    else:
+        fov_x = float(fov_x)
+
+    if fy is not None:
+        if float(fy) <= 0:
+            raise ValueError("fl_y must be positive.")
+        fov_y = 2.0 * math.atan(height / (2.0 * float(fy)))
+    else:
+        focal = width / (2.0 * math.tan(fov_x / 2.0))
+        fov_y = 2.0 * math.atan(height / (2.0 * focal))
+
+    if not (0.0 < fov_x < math.pi and 0.0 < fov_y < math.pi):
+        raise ValueError(f"Invalid camera FOV: fov_x={fov_x}, fov_y={fov_y}")
+
+    cameras = []
+    for index, frame in enumerate(frames):
+        transform = np.asarray(frame.get("transform_matrix"), dtype=np.float64)
+        if transform.shape != (4, 4) or not np.isfinite(transform).all():
+            raise ValueError(
+                f"Frame {index} must have a finite 4x4 transform_matrix."
+            )
+
+        # These stress-nerf matrices are already in Grendel/COLMAP camera
+        # coordinates (they match camera_to_JSON output), unlike Blender's
+        # OpenGL transforms that require flipping the Y and Z axes.
+        c2w = transform
+        try:
+            w2c = np.linalg.inv(c2w)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(f"Frame {index} has a singular transform_matrix.") from exc
+
+        file_path = str(frame.get("file_path", f"frame_{index:06d}"))
+        cameras.append(
+            Camera(
+                colmap_id=index,
+                R=np.transpose(w2c[:3, :3]),
+                T=w2c[:3, 3],
+                FoVx=fov_x,
+                FoVy=fov_y,
+                image=None,
+                gt_alpha_mask=None,
+                image_name=Path(file_path).stem,
+                uid=index,
+                image_path=None,
+                image_width=width,
+                image_height=height,
+            )
+        )
+
+    return cameras
+
+
 def is_dataset(path):
     return (path / "sparse").is_dir() or (path / "transforms_train.json").is_file()
 
 
 def checkpoint_path(model_path, iteration):
     return model_path / "point_cloud" / f"iteration_{iteration}"
+
+
+def discover_camera_traces(model_checkpoint, camera_sequence=None, include_pressure=True):
+    """Return the original trace followed by any distinct pressure traces."""
+    pressure_paths = {
+        name: model_checkpoint / f"{name}.json" for name in PRESSURE_SEQUENCES
+    }
+    explicit = Path(camera_sequence).expanduser().resolve() if camera_sequence else None
+    primary_name = "original"
+    if explicit is not None:
+        primary_name = next(
+            (name for name, path in pressure_paths.items() if path.resolve() == explicit),
+            "camera_sequence",
+        )
+    traces = [(primary_name, explicit)]
+    if include_pressure:
+        for name, path in pressure_paths.items():
+            if path.is_file() and (explicit is None or path.resolve() != explicit):
+                traces.append((name, path))
+    return traces
 
 
 def distributed_barrier():
@@ -310,7 +447,9 @@ def render_dataset(
     resolution_specs,
     split,
     warmup_batches,
+    camera_sequence=None,
     save_renders=True,
+    include_pressure=True,
 ):
     model_checkpoint = checkpoint_path(model_path, iteration)
     merged_point_cloud = model_checkpoint / "point_cloud.ply"
@@ -352,62 +491,84 @@ def render_dataset(
         gaussians = GaussianModel(dataset_args.sh_degree)
         scene = Scene(args, gaussians, load_iteration=iteration, shuffle=False)
 
-    actual_split = split
-    if split == "test":
-        views = scene.getTestCameras()
-        if not views:
-            views = scene.getTrainCameras()
-            actual_split = "train"
-    else:
-        views = scene.getTrainCameras()
-    if not views:
-        raise ValueError(f"No cameras found for dataset: {source_path}")
-
-    base_width = int(views[0].image_width)
-    base_height = int(views[0].image_height)
-    for camera in views:
-        if camera.image_width != base_width or camera.image_height != base_height:
-            raise ValueError("All cameras must have the same resolution.")
-
     background_color = [1, 1, 1] if dataset_args.white_background else [0, 0, 0]
     background = torch.tensor(background_color, dtype=torch.float32, device="cuda")
 
     results = []
-    for spec in resolution_specs:
-        label, width, height = resolve_resolution(spec, base_width, base_height)
-        render_dir = model_checkpoint / "render" / label if save_renders else None
-        # This is inference-only: Gaussian parameters are nn.Parameters with
-        # requires_grad=True, but building autograd graphs retains large
-        # preprocess/rasterizer tensors that are only needed for training.
-        with torch.no_grad():
-            benchmark = benchmark_resolution(
-                views,
-                gaussians,
-                pipeline_args,
-                background,
-                args,
-                width,
-                height,
-                warmup_batches,
-                render_dir,
-            )
-        results.append(
-            {
-                "resolution": label,
-                "width": width,
-                "height": height,
-                **benchmark,
-            }
+    failures = []
+    traces = discover_camera_traces(model_checkpoint, camera_sequence, include_pressure)
+    if include_pressure and utils.GLOBAL_RANK == 0:
+        found = [name for name, _ in traces if name in PRESSURE_SEQUENCES]
+        print(
+            f"[INFO] {source_path.name}: pressure sequences: {', '.join(found) or 'none found'}",
+            file=sys.stderr,
+            flush=True,
         )
-        if utils.GLOBAL_RANK == 0:
-            print(
-                f"{source_path.name}: {label}, {benchmark['frames']} frames, "
-                f"{benchmark['seconds']:.4f}s, {benchmark['fps']:.4f} FPS, "
-                f"avg latency {benchmark['avg_frame_latency_ms']:.3f} ms"
-            )
+    for trajectory, sequence_path in traces:
+        try:
+            if sequence_path is not None:
+                views = load_camera_sequence(sequence_path)
+                actual_split = "camera_sequence"
+            else:
+                actual_split = split
+                if split == "test":
+                    views = scene.getTestCameras()
+                    if not views:
+                        views = scene.getTrainCameras()
+                        actual_split = "train"
+                else:
+                    views = scene.getTrainCameras()
+            if not views:
+                raise ValueError(f"No cameras found for dataset: {source_path}")
+
+            base_width = int(views[0].image_width)
+            base_height = int(views[0].image_height)
+            for camera in views:
+                if camera.image_width != base_width or camera.image_height != base_height:
+                    raise ValueError("All cameras must have the same resolution.")
+
+            for spec in resolution_specs:
+                label, width, height = resolve_resolution(spec, base_width, base_height)
+                render_root = model_checkpoint / "render"
+                if trajectory in PRESSURE_SEQUENCES:
+                    render_root = render_root / trajectory
+                render_dir = render_root / label if save_renders else None
+                # Inference only: do not retain training autograd buffers.
+                with torch.no_grad():
+                    benchmark = benchmark_resolution(
+                        views,
+                        gaussians,
+                        pipeline_args,
+                        background,
+                        args,
+                        width,
+                        height,
+                        warmup_batches,
+                        render_dir,
+                    )
+                results.append(
+                    {
+                        "trajectory": trajectory,
+                        "split": actual_split,
+                        "camera_sequence": str(sequence_path.resolve()) if sequence_path else "",
+                        "resolution": label,
+                        "width": width,
+                        "height": height,
+                        **benchmark,
+                    }
+                )
+        except Exception as exc:
+            failures.append((f"{source_path.name}/{trajectory}", str(exc)))
+            if utils.GLOBAL_RANK == 0:
+                print(
+                    f"[FAILED] {source_path.name}/{trajectory}: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                traceback.print_exc(file=sys.stderr)
 
     log_file.close()
-    return results, actual_split
+    return results, failures
 
 
 def discover_datasets(dataset_root):
@@ -459,15 +620,29 @@ def main():
     parser.add_argument("--csv", dest="csv_path", default=None)
     parser.add_argument("--iteration", type=int, default=TARGET_ITERATION)
     parser.add_argument("--split", choices=("train", "test"), default="test")
+    parser.add_argument(
+        "--camera-sequence",
+        default=None,
+        help="Render frames from a transforms-style NeRF JSON instead of the COLMAP split.",
+    )
     parser.add_argument("--warmup-batches", type=int, default=2)
     parser.add_argument(
         "--no-save-renders",
         action="store_true",
         help="Only benchmark rendering; do not save PNG outputs.",
     )
+    parser.add_argument(
+        "--skip-pressure-sequences",
+        action="store_true",
+        help="Do not automatically benchmark pressure_scan.json and pressure_orbit.json.",
+    )
     cli_args = parser.parse_args()
 
     recursive, first_path, second_path = resolve_paths(cli_args)
+    if recursive and cli_args.camera_sequence:
+        raise ValueError(
+            "--camera-sequence is only supported in non-recursive mode because a camera trace belongs to one scene."
+        )
     resolution_specs = parse_resolution_specs(
         cli_args.resolutions or DEFAULT_RESOLUTIONS
     )
@@ -511,15 +686,18 @@ def main():
         )
 
         try:
-            results, actual_split = render_dataset(
+            results, trace_failures = render_dataset(
                 dataset_path,
                 model_path,
                 cli_args.iteration,
                 resolution_specs,
                 cli_args.split,
                 cli_args.warmup_batches,
+                camera_sequence=cli_args.camera_sequence,
                 save_renders=not cli_args.no_save_renders,
+                include_pressure=not cli_args.skip_pressure_sequences,
             )
+            failures.extend(trace_failures)
             if utils.GLOBAL_RANK == 0:
                 for result in results:
                     rows.append(
@@ -528,7 +706,9 @@ def main():
                             "model_path": str(model_path),
                             "iteration": cli_args.iteration,
                             "bsz": INFERENCE_BATCH_SIZE,
-                            "split": actual_split,
+                            "split": result["split"],
+                            "trajectory": result["trajectory"],
+                            "camera_sequence": result["camera_sequence"],
                             "resolution": result["resolution"],
                             "width": result["width"],
                             "height": result["height"],
@@ -562,6 +742,8 @@ def main():
             "iteration",
             "bsz",
             "split",
+            "trajectory",
+            "camera_sequence",
             "resolution",
             "width",
             "height",
