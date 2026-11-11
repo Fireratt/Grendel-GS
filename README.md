@@ -130,6 +130,99 @@ conda activate gaussian_splatting
 
 NOTES: We kept additional dependencies minimal compared to the original 3DGS. For environment setup issues, maybe you could refer to the [original 3DGS repo issue section](https://github.com/graphdeco-inria/gaussian-splatting/issues) first.
 
+### Reproducing this repository (including the local recursive scripts)
+
+Reproduction on another machine is feasible, but it is not fully containerized: Grendel compiles CUDA extensions locally, so the NVIDIA driver, PyTorch CUDA build, CUDA toolkit (`nvcc`), compiler, and GPU architecture must be compatible. Record the repository commit and submodule revisions together with experiment results (`git rev-parse HEAD` and `git submodule status`).
+
+#### 1. Host requirements and checkout
+
+Use a Linux machine with an NVIDIA GPU, a working NVIDIA driver/NVIDIA Container Toolkit if using Docker, and a CUDA-capable PyTorch installation. For a source checkout, include all three CUDA submodules:
+
+```bash
+git clone --recursive <Grendel-GS-repository-url>
+cd Grendel-GS
+git submodule update --init --recursive
+nvidia-smi
+```
+
+The COLMAP dataset must be prepared before training. A typical scene directory contains `images/` and `sparse/` (COLMAP format); the recursive scripts discover scenes under a dataset root.
+
+#### 2. Python and CUDA extension build
+
+The checked-in `environment.yml` specifies Python 3.8, PyTorch 2.2.0, torchvision 0.17.0, and PyTorch CUDA 12.1. Create and activate it with:
+
+```bash
+conda env create -f environment.yml
+conda activate Grendel
+```
+
+The local `build.sh` currently expects CUDA Toolkit 12.4 at `/usr/local/cuda-12.4` and GCC/G++ 11. It builds `simple-knn`, the customized `diff-gaussian-rasterization`, and `gsplat`:
+
+```bash
+which nvcc
+nvcc --version
+gcc-11 --version
+python -c 'import torch; print("torch", torch.__version__, "torch CUDA", torch.version.cuda, "available", torch.cuda.is_available())'
+./build.sh
+```
+
+Before building on a different machine, check that `CUDA_HOME`, `nvcc`, the PyTorch CUDA version, and the compiler are mutually compatible. In particular, the supplied Conda environment uses PyTorch CUDA 12.1 while `build.sh` selects Toolkit 12.4; CUDA extension builds can warn or fail when these differ. The supplied `Dockerfile.runner` is **not** a complete Grendel build/training image: it is a Vulkan application runtime based on a CUDA *runtime* image, and does not install PyTorch, `nvcc`, or the Grendel Python CUDA extensions.
+
+This repository includes `Dockerfile.grendel-runner`, a separate CUDA development image that installs the Conda environment and builds the extensions. Build it from the repository root after initializing the submodules:
+
+```bash
+git submodule update --init --recursive
+docker build -f Dockerfile.grendel-runner -t grendel-runner:local .
+docker run --rm --gpus all --ipc=host -it \
+  -v /data:/data -v /output:/output \
+  grendel-runner:local
+```
+
+The image embeds this checkout; mount datasets and output directories at paths visible inside the container. `TORCH_CUDA_ARCH_LIST` is set for common NVIDIA architectures (Volta through Hopper); override it at build time if the target GPU has a different compute capability, for example `--build-arg TORCH_CUDA_ARCH_LIST="8.6"`.
+
+CUDA compatibility notes: the container does **not** need the same CUDA Toolkit installed on the host. The container supplies its own user-space toolkit/libraries, while `--gpus all` exposes the host GPU and injects the host NVIDIA driver interface. The host must have a working NVIDIA driver and NVIDIA Container Toolkit, and that driver must be new enough for the container's CUDA stack. CUDA 12.x minor-version compatibility lists Linux driver 525.60.13 as a baseline, but CUDA 12.4's corresponding driver is 550.54.14; using the latter or newer is the safer choice, especially for features outside minor-version compatibility. See NVIDIA's [CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html) and [CUDA 12.4 release notes](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-toolkit-release-notes/index.html). The Conda environment currently provides PyTorch CUDA 12.1 while the image's compiler toolkit is CUDA 12.4, matching the existing build setup; extension compilation may emit a minor-version warning. If compilation or runtime fails, align PyTorch's CUDA build and the container toolkit, rebuild all extensions inside the image, and avoid copying compiled `.so` files between different PyTorch/CUDA environments. This image has not been validated on every GPU/driver combination.
+
+Check the Python entry points after the extension build:
+
+```bash
+python train.py --help
+python recursive_render.py --help
+```
+
+#### 3. Train, merge, and benchmark
+
+For a two-GPU single-scene training run (replace the path with a prepared COLMAP scene):
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=2 train.py \
+  -s /data/tanksandtemples/truck \
+  -m /output/truck \
+  --bsz 1 --eval --iterations 30000 --resolution -1
+```
+
+To train each recognized scene directly under a dataset root with the repository's recursive settings:
+
+```bash
+./train_recursive.sh --recursive /data/tanksandtemples
+```
+
+Merge distributed point-cloud shards before rendering. The merge script currently looks for `iteration_30000` by default; make that match the checkpoint produced by your training run:
+
+```bash
+./recursive_merge.sh /data/tanksandtemples/truck /data/tanksandtemples/truck/trained
+```
+
+Then benchmark the merged model without saving rendered PNGs; FPS/latency results are written to CSV under the model's point-cloud iteration output:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=1 recursive_render.py \
+  /data/tanksandtemples/truck \
+  /data/tanksandtemples/truck/trained \
+  --iteration 30000 --resolutions 1.0 0.5 3840x2160 --no-save-renders
+```
+
+If using `train_recursive.sh`, check its configured saved iteration and align `recursive_merge.sh` and `recursive_render.py --iteration` with the actual `point_cloud/iteration_<N>` directory. For repeatable FPS comparisons, keep the GPU model/count, driver, power mode, resolution list, camera trace, warm-up/measurement settings, and repository/submodule revisions fixed; ensure no other GPU workload is running. Training memory use and the final Gaussian count depend strongly on the scene and GPU capacity, so a run that fits one machine may need lower input resolution or adjusted training settings on another.
+
 ### Dataset
 
 We use colmap format to load dataset. Therefore, please download and unzip colmap datasets before trainning, for example [Mip360 dataset](http://storage.googleapis.com/gresearch/refraw360/360_v2.zip) and 4 scenes from [Tanks&Temple and DeepBlending](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip). 

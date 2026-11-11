@@ -1,0 +1,52 @@
+# CUDA development/runtime environment for Grendel-GS.
+# Build from the repository root after initializing the git submodules.
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda-12.4 \
+    CUDA_ROOT=/usr/local/cuda-12.4 \
+    CUDA_PATH=/usr/local/cuda-12.4 \
+    CC=gcc-11 \
+    CXX=g++-11 \
+    CUDAHOSTCXX=g++-11 \
+    MAX_JOBS=2
+
+ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0+PTX"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+WORKDIR /workspace/Grendel-GS
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git build-essential gcc-11 g++-11 \
+        libgl1 libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin the Conda installer; the environment itself is defined in environment.yml.
+RUN curl -fsSL \
+        https://github.com/conda-forge/miniforge/releases/download/24.3.0-0/Miniforge3-24.3.0-0-Linux-x86_64.sh \
+        -o /tmp/miniforge.sh \
+    && bash /tmp/miniforge.sh -b -p /opt/conda \
+    && rm /tmp/miniforge.sh
+
+ENV PATH=/opt/conda/envs/Grendel/bin:/opt/conda/bin:${PATH}
+
+COPY environment.yml /tmp/environment.yml
+RUN conda env create --file /tmp/environment.yml \
+    && conda clean --all --yes
+
+COPY . /workspace/Grendel-GS
+
+# build.sh currently hardcodes /usr/local/cuda-12.4. Official CUDA images
+# may expose the toolkit only through /usr/local/cuda, so provide that alias.
+RUN if [[ ! -x "${CUDA_HOME}/bin/nvcc" && ! -e "${CUDA_HOME}" ]]; then \
+        ln -s /usr/local/cuda "${CUDA_HOME}"; \
+    fi \
+    && test -x "${CUDA_HOME}/bin/nvcc" \
+    && nvcc --version \
+    && python -c 'import torch; print("PyTorch:", torch.__version__); print("PyTorch CUDA:", torch.version.cuda)' \
+    && ./build.sh \
+    && python -c 'import diff_gaussian_rasterization, simple_knn; print("Grendel CUDA extensions installed")'
+
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+CMD ["bash"]
