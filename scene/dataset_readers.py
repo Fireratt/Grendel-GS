@@ -121,10 +121,9 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(
-            image_path
-        )  # this is a lazy load, the image is not loaded yet
-        width, height = image.size
+        if not getattr(args, "fps_test", False):
+            with Image.open(image_path) as image:
+                width, height = image.size
 
         cam_info = CameraInfo(
             uid=uid,
@@ -138,10 +137,6 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             width=width,
             height=height,
         )
-
-        # release memory
-        image.close()
-        image = None
 
         cam_infos.append(cam_info)
     return cam_infos
@@ -220,6 +215,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=10):
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
+    if getattr(utils.get_args(), "fps_test", False):
+        return SceneInfo(None, train_cam_infos, test_cam_infos, nerf_normalization, ply_path)
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
     if not os.path.exists(ply_path):
@@ -374,10 +371,20 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             image_path = cam_name
             image_name = Path(cam_name).stem
-            image = Image.open(image_path)
-            width, height = image.size
-            image.close()
-            image = None
+            if getattr(utils.get_args(), "fps_test", False):
+                width = frame.get("w") or contents.get("w")
+                height = frame.get("h") or contents.get("h")
+                if not width or not height:
+                    raise ValueError(
+                        f"FPS-only Blender camera metadata requires positive w/h in {transformsfile}; "
+                        "image dimensions cannot be inferred without the source images."
+                    )
+                width, height = int(width), int(height)
+                if width <= 0 or height <= 0:
+                    raise ValueError(f"Invalid camera dimensions in {transformsfile}: {width}x{height}")
+            else:
+                with Image.open(image_path) as image:
+                    width, height = image.size
 
             fovy = focal2fov(fov2focal(fovx, width), height)
             FovY = fovy
@@ -414,6 +421,8 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, "points3d.ply")
+    if getattr(utils.get_args(), "fps_test", False):
+        return SceneInfo(None, train_cam_infos, test_cam_infos, nerf_normalization, ply_path)
     
     # ========== 关键修复：删除旧的错误点云缓存 ==========
     # 如果之前已经用错误的 [-1.3, 1.3] 范围生成过 points3d.ply，

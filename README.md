@@ -212,14 +212,16 @@ Merge distributed point-cloud shards before rendering. The merge script currentl
 ./recursive_merge.sh /data/tanksandtemples/truck /data/tanksandtemples/truck/trained
 ```
 
-Then benchmark the merged model without saving rendered PNGs; FPS/latency results are written to CSV under the model's point-cloud iteration output:
+Then benchmark the merged model without loading dataset images or saving rendered PNGs; FPS/latency results are written to `recursive_render_fps.csv` in the model directory:
 
 ```bash
 torchrun --standalone --nnodes=1 --nproc-per-node=1 recursive_render.py \
   /data/tanksandtemples/truck \
   /data/tanksandtemples/truck/trained \
-  --iteration 30000 --resolutions 1.0 0.5 3840x2160 --no-save-renders
+  --iteration 30000 --resolutions 1.0 0.5 3840x2160 --fps-test
 ```
+
+`--fps-test` needs the merged `point_cloud.ply` and camera metadata, but does not need the source images or the initial COLMAP point cloud. For COLMAP scenes, supply `sparse/0/cameras.bin` and `images.bin` (or their `.txt` equivalents); native dimensions come from the COLMAP camera records, which may differ from separately resized images. For Blender scenes, the transform JSON files must specify positive `w` and `h` globally or per frame. `--fps-test` also disables PNG output; use `--no-save-renders` alone to keep the normal image-metadata loading behavior.
 
 If using `train_recursive.sh`, check its configured saved iteration and align `recursive_merge.sh` and `recursive_render.py --iteration` with the actual `point_cloud/iteration_<N>` directory. For repeatable FPS comparisons, keep the GPU model/count, driver, power mode, resolution list, camera trace, warm-up/measurement settings, and repository/submodule revisions fixed; ensure no other GPU workload is running. Training memory use and the final Gaussian count depend strongly on the scene and GPU capacity, so a run that fits one machine may need lower input resolution or adjusted training settings on another.
 

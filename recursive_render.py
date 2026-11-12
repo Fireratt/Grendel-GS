@@ -450,6 +450,7 @@ def render_dataset(
     camera_sequence=None,
     save_renders=True,
     include_pressure=True,
+    fps_test=False,
 ):
     model_checkpoint = checkpoint_path(model_path, iteration)
     merged_point_cloud = model_checkpoint / "point_cloud.ply"
@@ -475,6 +476,7 @@ def render_dataset(
         args.local_sampling = False
     args.lazy_image_loading = True
     args.image_loading_mode = "lazy"
+    args.fps_test = fps_test
     args.preload_dataset_to_gpu = False
     args.multiprocesses_image_loading = False
     args.bsz = INFERENCE_BATCH_SIZE
@@ -632,6 +634,11 @@ def main():
         help="Only benchmark rendering; do not save PNG outputs.",
     )
     parser.add_argument(
+        "--fps-test",
+        action="store_true",
+        help="Benchmark without source images or PNG output; use camera metadata for image dimensions.",
+    )
+    parser.add_argument(
         "--skip-pressure-sequences",
         action="store_true",
         help="Do not automatically benchmark pressure_scan.json and pressure_orbit.json.",
@@ -694,8 +701,9 @@ def main():
                 cli_args.split,
                 cli_args.warmup_batches,
                 camera_sequence=cli_args.camera_sequence,
-                save_renders=not cli_args.no_save_renders,
+                save_renders=not (cli_args.no_save_renders or cli_args.fps_test),
                 include_pressure=not cli_args.skip_pressure_sequences,
+                fps_test=cli_args.fps_test,
             )
             failures.extend(trace_failures)
             if utils.GLOBAL_RANK == 0:

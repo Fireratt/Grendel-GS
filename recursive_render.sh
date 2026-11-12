@@ -1,54 +1,95 @@
-torchrun --standalone --nnodes=1 --nproc-per-node=2 recursive_render.py \
-/home/ps/hjf/3dgs/res/training/building \
-/home/ps/hjf/3dgs/res/rubble-colmap/output/grendel_all \
---iteration 70000 \
---resolutions 3840x2160 \
---no-save-renders \
-2>&1 | tee building_fps.log
+#!/bin/bash
+set -e
 
-torchrun --standalone --nnodes=1 --nproc-per-node=2 recursive_render.py \
-/home/ps/hjf/3dgs/res/rubble-colmap \
-/home/ps/hjf/3dgs/res/rubble-colmap/output/grendel_all \
---iteration 70000 \
---resolutions 3840x2160 \
-2>&1 | tee building_fps.log
+# ================= 配置区 =================
+RES_HOME="/home/ps/hjf/3dgs/res"
 
-TARGET_HOME=/home/ps/hjf/3dgs/res/training/tanksandtemples/truck
+# 允许配置多个分辨率，脚本会自动用逗号拼接
+RESOLUTION_LIST=("3840x2160")
 
-torchrun --standalone --nnodes=1 --nproc-per-node=1 recursive_render.py \
-${TARGET_HOME} ${TARGET_HOME}/trained \
---iteration 29997 \
---resolutions 3840x2160 \
---no-save-renders
+# 默认 GPU 进程数
+NPROC_DEFAULT=1
+NPROC_MULTI=2
 
-TARGET_HOME=/home/ps/hjf/3dgs/res/training/tanksandtemples/train
+# 将分辨率数组转换为逗号分隔的字符串
+RES_STR=$(IFS=,; echo "${RESOLUTION_LIST[*]}")
+# ==========================================
 
-torchrun --standalone --nnodes=1 --nproc-per-node=1 recursive_render.py \
-${TARGET_HOME} ${TARGET_HOME}/trained \
---iteration 29997 \
---resolutions 3840x2160 \
---no-save-renders
+# 核心渲染函数
+# 参数:
+#   $1: 源目录 (source_dir)
+#   $2: 输出目录 (output_dir)
+#   $3: iteration
+#   $4: nproc_per_node
+#   $5: 日志文件名 (可选)
+run_render() {
+    local src_dir="$1"
+    local out_dir="$2"
+    local iteration="$3"
+    local nproc="${4:-$NPROC_DEFAULT}"
+    local log_file="$5"
 
-TARGET_HOME=/home/ps/hjf/3dgs/res/training/deep-blending/drjohnson
+    local cmd=(
+        torchrun --standalone --nnodes=1 "--nproc-per-node=${nproc}" recursive_render.py
+        "${src_dir}" "${out_dir}"
+        --iteration "${iteration}"
+        --resolutions "${RES_STR}"
+        --fps-test
+    )
 
-torchrun --standalone --nnodes=1 --nproc-per-node=1 recursive_render.py \
-${TARGET_HOME} ${TARGET_HOME}/trained \
---iteration 30000 \
---resolutions 3840x2160 \
---no-save-renders
+    echo "=========================================="
+    echo "Running: ${src_dir} -> ${out_dir} (iter: ${iteration}, nproc: ${nproc})"
+    echo "=========================================="
 
-TARGET_HOME=/home/ps/hjf/3dgs/res/training/deep-blending/playroom
+    if [[ -n "${log_file}" ]]; then
+        "${cmd[@]}" 2>&1 | tee "${log_file}"
+    else
+        "${cmd[@]}"
+    fi
+}
 
-torchrun --standalone --nnodes=1 --nproc-per-node=1 recursive_render.py \
-${TARGET_HOME} ${TARGET_HOME}/trained \
---iteration 30000 \
---resolutions 3840x2160 \
---no-save-renders
+# ================= 执行区 =================
 
+# 1. training/building
+run_render \
+    "${RES_HOME}/training/building" \
+    "${RES_HOME}/rubble-colmap/output/grendel_all" \
+    70000 \
+    "${NPROC_MULTI}" \
+    "building_fps.log"
 
-# torchrun --standalone --nnodes=1 --nproc-per-node=2 \
-# recursive_render.py \
-# ${TARGET_HOME} ${TARGET_HOME}/trained \
-# --iteration 29997 \
-# --resolutions 1.0 0.5 3840x2160 \
-# --no-save-renders
+# 2. rubble-colmap
+run_render \
+    "${RES_HOME}/rubble-colmap" \
+    "${RES_HOME}/rubble-colmap/output/grendel_all" \
+    70000 \
+    "${NPROC_MULTI}" \
+    "building_fps.log"
+
+# 3. tanksandtemples/truck
+run_render \
+    "${RES_HOME}/training/tanksandtemples/truck" \
+    "${RES_HOME}/training/tanksandtemples/truck/trained" \
+    29997 \
+    "${NPROC_DEFAULT}"
+
+# 4. tanksandtemples/train
+run_render \
+    "${RES_HOME}/training/tanksandtemples/train" \
+    "${RES_HOME}/training/tanksandtemples/train/trained" \
+    29997 \
+    "${NPROC_DEFAULT}"
+
+# 5. deep-blending/drjohnson
+run_render \
+    "${RES_HOME}/training/deep-blending/drjohnson" \
+    "${RES_HOME}/training/deep-blending/drjohnson/trained" \
+    30000 \
+    "${NPROC_DEFAULT}"
+
+# 6. deep-blending/playroom
+run_render \
+    "${RES_HOME}/training/deep-blending/playroom" \
+    "${RES_HOME}/training/deep-blending/playroom/trained" \
+    30000 \
+    "${NPROC_DEFAULT}"
