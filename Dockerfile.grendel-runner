@@ -33,6 +33,9 @@ ENV PATH=/opt/conda/envs/Grendel/bin:/opt/conda/bin:${PATH}
 
 COPY environment.yml /tmp/environment.yml
 RUN conda env create --file /tmp/environment.yml \
+    && python -m pip install --no-cache-dir --force-reinstall \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        "torch==2.2.0+cu121" "torchvision==0.17.0+cu121" \
     && conda clean --all --yes
 
 COPY . /workspace/Grendel-GS
@@ -44,7 +47,7 @@ RUN if [[ ! -x "${CUDA_HOME}/bin/nvcc" && ! -e "${CUDA_HOME}" ]]; then \
     fi \
     && test -x "${CUDA_HOME}/bin/nvcc" \
     && nvcc --version \
-    && python -c 'import torch; print("PyTorch:", torch.__version__); print("PyTorch CUDA:", torch.version.cuda)' \
+    && python -c 'import torch; print("PyTorch:", torch.__version__); print("PyTorch CUDA:", torch.version.cuda); assert torch.version.cuda is not None, "CPU-only PyTorch installed; CUDA extensions cannot be built"' \
     && ./build.sh \
     && python -c 'import diff_gaussian_rasterization, simple_knn; print("Grendel CUDA extensions installed")'
 
